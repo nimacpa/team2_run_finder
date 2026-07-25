@@ -7,6 +7,7 @@
   // ---------- confidence thresholds ----------
   const MIN_ACCEPT_SCORE = 0.72; // below this, don't even suggest it
   const CONFIDENT_MARGIN = 0.1; // best must beat second-best by this to be "confident"
+  const LOW_CONFIDENCE_FLOOR = 0.55; // below this, don't present candidates as "guesses" at all
 
   // ---------- screens ----------
   const screens = {
@@ -98,6 +99,55 @@
     });
   }
 
+  // Grayscale + contrast-stretch the captured photo before OCR. This alone
+  // meaningfully improves recognition on uneven lighting, low-contrast pen
+  // on paper, and glare - without a hard binarize that can destroy faint strokes.
+  function preprocessForOcr(sourceCanvas) {
+    const out = document.createElement('canvas');
+    out.width = sourceCanvas.width;
+    out.height = sourceCanvas.height;
+    const ctx = out.getContext('2d');
+    ctx.drawImage(sourceCanvas, 0, 0);
+    const imgData = ctx.getImageData(0, 0, out.width, out.height);
+    const d = imgData.data;
+    const n = d.length / 4;
+    const gray = new Uint8ClampedArray(n);
+
+    for (let i = 0; i < n; i++) {
+      const r = d[i * 4], g = d[i * 4 + 1], b = d[i * 4 + 2];
+      gray[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+    }
+
+    // find robust min/max (1st/99th percentile) to stretch contrast
+    const hist = new Array(256).fill(0);
+    for (let i = 0; i < n; i++) hist[gray[i]]++;
+    let cum = 0;
+    let lo = 0, hi = 255;
+    const loTarget = n * 0.01;
+    const hiTarget = n * 0.99;
+    for (let v = 0; v < 256; v++) {
+      cum += hist[v];
+      if (cum >= loTarget) { lo = v; break; }
+    }
+    cum = 0;
+    for (let v = 255; v >= 0; v--) {
+      cum += hist[v];
+      if (cum >= n - hiTarget) { hi = v; break; }
+    }
+    if (hi <= lo) { lo = 0; hi = 255; }
+    const range = hi - lo || 1;
+
+    for (let i = 0; i < n; i++) {
+      let v = ((gray[i] - lo) / range) * 255;
+      v = Math.max(0, Math.min(255, v));
+      d[i * 4] = v;
+      d[i * 4 + 1] = v;
+      d[i * 4 + 2] = v;
+    }
+    ctx.putImageData(imgData, 0, 0);
+    return out;
+  }
+
   // ---------- OCR (tesseract.js, fully local paths) ----------
   let worker = null;
   let workerReady = null;
@@ -120,8 +170,25 @@
   async function runOcr(sourceCanvas) {
     await initWorker();
     $('#scan-status').textContent = 'Reading label…';
-    const { data } = await worker.recognize(sourceCanvas);
-    return data.text || '';
+    const processed = preprocessForOcr(sourceCanvas);
+
+    // Pass 1: treat the photo as one uniform block of text (best for a tightly
+    // framed address block).
+    await worker.setParameters({ tessedit_pageseg_mode: '6' });
+    let { data } = await worker.recognize(processed);
+    let text = data.text || '';
+
+    // Pass 2 fallback: if barely anything came back, try fully-automatic
+    // layout analysis instead - helps when the frame includes more than just
+    // the address (whole label, extra margins, etc).
+    if (text.replace(/\s/g, '').length < 6) {
+      await worker.setParameters({ tessedit_pageseg_mode: '3' });
+      const retry = await worker.recognize(processed);
+      if ((retry.data.text || '').replace(/\s/g, '').length > text.replace(/\s/g, '').length) {
+        text = retry.data.text || '';
+      }
+    }
+    return text;
   }
 
   // ---------- main scan flow ----------
@@ -185,12 +252,17 @@
     $('#result-status').className = 'status-pill status-warn';
     $('#result-detail').textContent = '';
 
-    if (matchResult && matchResult.best) {
+    const bestIsPlausible = matchResult && matchResult.best && matchResult.best.score >= LOW_CONFIDENCE_FLOOR;
+
+    if (bestIsPlausible) {
       $('#result-street').textContent = matchResult.best.street.display + ' (best guess)';
     } else {
-      $('#result-street').textContent = 'Could not read a street name';
+      $('#result-street').textContent = 'Could not confidently read a street name';
     }
-    $('#result-raw-text').textContent = rawText.trim() || '(no text detected)';
+    $('#result-raw-text').textContent = rawText.trim() || '(no text detected - try moving closer / better light)';
+    // auto-reveal the raw OCR text whenever we're unsure, so it's obvious
+    // whether this is a data problem or an OCR-read problem
+    $('#result-raw-wrap').classList.remove('hidden');
 
     // build candidate chips
     const panel = $('#result-ambiguous-panel');
@@ -199,12 +271,13 @@
     list.innerHTML = '';
 
     const candidates = [];
-    if (matchResult) {
-      matchResult.allTop.slice(0, 5).forEach((c) => {
-        candidates.push({ street: c.street, number: c.number });
-      });
+    if (bestIsPlausible) {
+      matchResult.allTop
+        .filter((c) => c.score >= LOW_CONFIDENCE_FLOOR)
+        .slice(0, 5)
+        .forEach((c) => candidates.push({ street: c.street, number: c.number }));
     }
-    if (resolved && resolved.matches && matchResult && matchResult.best) {
+    if (resolved && resolved.matches && matchResult && matchResult.best && bestIsPlausible) {
       // if we had a street match but numbers didn't line up, surface its rows too
       resolved.matches.forEach((row) => {
         if (!candidates.find((c) => c.street.key === matchResult.best.street.key)) {
@@ -214,7 +287,7 @@
     }
 
     if (candidates.length === 0) {
-      list.innerHTML = '<p class="muted">No close street matches found.</p>';
+      list.innerHTML = '<p class="muted">No confident street matches. Check the raw text below, or search manually.</p>';
     } else {
       candidates.forEach((c) => {
         const btn = document.createElement('button');

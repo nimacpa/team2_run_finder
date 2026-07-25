@@ -1,4 +1,4 @@
-const CACHE_NAME = 'run-finder-v1';
+const CACHE_NAME = 'run-finder-v2';
 
 const PRECACHE_URLS = [
   './',

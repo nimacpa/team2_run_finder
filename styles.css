@@ -152,6 +152,16 @@ html, body {
   align-items: center;
 }
 
+.ocr-tip {
+  font-size: 13px;
+  color: var(--text-dim);
+  text-align: center;
+  margin: 0;
+  padding: 0 8px;
+  line-height: 1.4;
+}
+.ocr-tip strong { color: var(--text); }
+
 .btn {
   border: none;
   border-radius: 14px;
